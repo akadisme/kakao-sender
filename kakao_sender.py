@@ -410,16 +410,49 @@ def send_image(room_hwnd, path):
     raise RuntimeError("이미지 전송창이 닫히지 않음")
 
 
+def set_clipboard_text(text):
+    for _ in range(10):
+        try:
+            win32clipboard.OpenClipboard()
+            break
+        except Exception:
+            time.sleep(0.3)
+    else:
+        raise RuntimeError("클립보드를 사용할 수 없음")
+    try:
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardData(win32clipboard.CF_UNICODETEXT, text)
+    finally:
+        win32clipboard.CloseClipboard()
+
+
 def send_text(room_hwnd, text):
     edit = find_input(room_hwnd)
     text = text.replace("\r\n", "\n").replace("\n", "\r\n")
-    set_text(edit, text)
-    time.sleep(0.6)
-    post_key(edit, win32con.VK_RETURN)
+    set_text(edit, "")
+    time.sleep(0.3)
+
+    if force_foreground(room_hwnd):
+        # 실제 사람처럼: 입력창 클릭 -> 붙여넣기 -> 엔터
+        click_center(edit)
+        time.sleep(0.3)
+        set_clipboard_text(text)
+        real_key(ord("V"), ctrl=True)
+        time.sleep(0.8)
+        if text_len(edit) == 0:  # 붙여넣기가 안 됐으면 직접 입력
+            set_text(edit, text)
+            time.sleep(0.5)
+        real_key(win32con.VK_RETURN)
+    else:
+        set_text(edit, text)
+        time.sleep(0.6)
+        post_key(edit, win32con.VK_RETURN)
+
     for _ in range(20):
         time.sleep(0.25)
         if text_len(edit) == 0:
             return
+    log.info(f"  [진단] 전경창={describe(win32gui.GetForegroundWindow())}, 입력창 글자수={text_len(edit)}")
     raise RuntimeError("문구 전송 확인 실패")
 
 
