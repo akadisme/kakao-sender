@@ -3,6 +3,7 @@
 카카오톡 오픈채팅방 자동 발송기 (2번컴터용)
 구글시트 대기 항목 읽기 -> 카톡 PC에서 채팅방 열기 -> 이미지 전송 -> 문구 전송 -> 시트에 결과 기록
 """
+import ctypes
 import datetime
 import io
 import json
@@ -203,6 +204,13 @@ def set_text(h, s):
 
 def text_len(h):
     return win32gui.SendMessage(h, win32con.WM_GETTEXTLENGTH, 0, 0)
+
+
+def get_text(h):
+    n = text_len(h)
+    buf = ctypes.create_unicode_buffer(n + 2)
+    ctypes.windll.user32.SendMessageW(h, win32con.WM_GETTEXT, n + 2, buf)
+    return buf.value
 
 
 def post_key(h, vk):
@@ -429,6 +437,12 @@ def set_clipboard_text(text):
 def send_text(room_hwnd, text):
     edit = find_input(room_hwnd)
     text = text.replace("\r\n", "\n").replace("\n", "\r\n")
+    # 입력창에 안내문구(예: '메시지 입력')가 잡힐 수 있어, 우리 문구 앞부분이 남아있는지로 판단
+    sig = re.sub(r"\s+", "", text)[:12]
+
+    def still_there():
+        return sig and sig in re.sub(r"\s+", "", get_text(edit))
+
     set_text(edit, "")
     time.sleep(0.3)
 
@@ -439,7 +453,7 @@ def send_text(room_hwnd, text):
         set_clipboard_text(text)
         real_key(ord("V"), ctrl=True)
         time.sleep(0.8)
-        if text_len(edit) == 0:  # 붙여넣기가 안 됐으면 직접 입력
+        if not still_there():  # 붙여넣기가 안 됐으면 직접 입력
             set_text(edit, text)
             time.sleep(0.5)
         real_key(win32con.VK_RETURN)
@@ -450,9 +464,9 @@ def send_text(room_hwnd, text):
 
     for _ in range(20):
         time.sleep(0.25)
-        if text_len(edit) == 0:
+        if not still_there():
             return
-    log.info(f"  [진단] 전경창={describe(win32gui.GetForegroundWindow())}, 입력창 글자수={text_len(edit)}")
+    log.info(f"  [진단] 전경창={describe(win32gui.GetForegroundWindow())}, 입력창='{get_text(edit)[:20]}'")
     raise RuntimeError("문구 전송 확인 실패")
 
 
