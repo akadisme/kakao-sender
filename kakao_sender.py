@@ -19,6 +19,7 @@ import win32clipboard
 import win32con
 import win32event
 import win32gui
+import win32process
 import winerror
 from gspread.utils import rowcol_to_a1
 from PIL import Image
@@ -333,28 +334,77 @@ def set_clipboard_image(path):
         win32clipboard.CloseClipboard()
 
 
+def window_pid(h):
+    try:
+        return win32process.GetWindowThreadProcessId(h)[1]
+    except Exception:
+        return 0
+
+
+def visible_windows_of(pid):
+    return {h for h in enum_top_windows() if win32gui.IsWindowVisible(h) and window_pid(h) == pid}
+
+
+def click_center(h):
+    l, t, r, b = win32gui.GetWindowRect(h)
+    x, y = (l + r) // 2, (t + b) // 2
+    win32api.SetCursorPos((x, y))
+    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+    time.sleep(0.05)
+    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+
+def describe(h):
+    try:
+        return f"{win32gui.GetClassName(h)}/'{win32gui.GetWindowText(h)}'"
+    except Exception:
+        return str(h)
+
+
 def send_image(room_hwnd, path):
     set_clipboard_image(path)
     edit = find_input(room_hwnd)
     set_text(edit, "")
     if not force_foreground(room_hwnd):
         raise RuntimeError("채팅방 창을 앞으로 가져오지 못함(화면 잠금 확인)")
+    click_center(edit)  # 입력창에 커서 두기
+    time.sleep(0.4)
+
+    pid = window_pid(room_hwnd)
+    before = visible_windows_of(pid)
     real_key(ord("V"), ctrl=True)
 
     popup = 0
-    for _ in range(24):  # 이미지 전송 확인창 대기
+    for _ in range(24):  # 이미지 전송 확인창 대기 (최대 6초)
         time.sleep(0.25)
+        new = visible_windows_of(pid) - before
+        if new:
+            popup = next(iter(new))
+            break
         fg = win32gui.GetForegroundWindow()
-        if fg and fg != room_hwnd and is_kakao(fg):
+        if fg and fg != room_hwnd and window_pid(fg) == pid:
             popup = fg
             break
+        if not win32gui.IsWindowEnabled(room_hwnd):  # 모달창이 떠서 채팅방이 잠김
+            popup = -1
+            break
+
     if not popup:
+        fg = win32gui.GetForegroundWindow()
+        log.info(f"  [진단] 전경창={describe(fg)}, 입력창 글자수={text_len(edit)}")
         raise RuntimeError("이미지 전송창이 뜨지 않음")
+
+    if popup > 0:
+        log.info(f"  [진단] 전송창={describe(popup)}")
+        force_foreground(popup)
     time.sleep(0.6)
     real_key(win32con.VK_RETURN)
+
     for _ in range(40):
         time.sleep(0.25)
-        if not win32gui.IsWindow(popup) or not win32gui.IsWindowVisible(popup):
+        closed = (popup > 0 and (not win32gui.IsWindow(popup) or not win32gui.IsWindowVisible(popup))) or \
+                 (popup == -1 and win32gui.IsWindowEnabled(room_hwnd))
+        if closed:
             time.sleep(1.5)  # 업로드 여유
             return
     raise RuntimeError("이미지 전송창이 닫히지 않음")
