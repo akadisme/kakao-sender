@@ -1,0 +1,9 @@
+{
+  "spreadsheet_id": "여기에_구글시트_ID_붙여넣기",
+  "worksheet": "2번컴터",
+  "image_folder": "C:/Users/USER/Desktop/단지마커",
+  "delay_between_rooms_min": 4,
+  "delay_between_rooms_max": 9,
+  "kakao_wait_sec": 300,
+  "test_mode": true
+}
