@@ -356,10 +356,34 @@ def visible_windows_of(pid):
 def click_center(h):
     l, t, r, b = win32gui.GetWindowRect(h)
     x, y = (l + r) // 2, (t + b) // 2
-    win32api.SetCursorPos((x, y))
-    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+    try:
+        win32api.SetCursorPos((x, y))
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.05)
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        return
+    except Exception:
+        pass
+    # 마우스 커서를 못 움직이는 상황(화면 꺼짐 등) -> 창에 직접 클릭 메시지 전송
+    lp = win32api.MAKELONG((r - l) // 2, (b - t) // 2)
+    win32gui.PostMessage(h, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lp)
     time.sleep(0.05)
-    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+    win32gui.PostMessage(h, win32con.WM_LBUTTONUP, 0, lp)
+
+
+ES_CONTINUOUS, ES_SYSTEM_REQUIRED, ES_DISPLAY_REQUIRED = 0x80000000, 0x00000001, 0x00000002
+
+
+def wake_display():
+    """꺼진 화면을 켜고, 발송하는 동안 화면이 꺼지지 않게 유지"""
+    try:
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+        win32api.mouse_event(win32con.MOUSEEVENTF_MOVE, 1, 0, 0, 0)
+        time.sleep(0.05)
+        win32api.mouse_event(win32con.MOUSEEVENTF_MOVE, -1, 0, 0, 0)
+    except Exception:
+        pass
+    time.sleep(3)
 
 
 def describe(h):
@@ -489,6 +513,7 @@ def run():
             write_result(ws, idx, t["row"], "실패: 카카오톡 미실행")
         return
 
+    wake_display()
     ok = fail = 0
     for i, t in enumerate(targets, 1):
         log.info(f"[{i}/{len(targets)}] {t['room']} 발송 중")
