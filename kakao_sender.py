@@ -8,9 +8,11 @@ import datetime
 import io
 import json
 import logging
+import ntpath
 import os
 import random
 import re
+import subprocess
 import sys
 import time
 
@@ -23,7 +25,9 @@ import win32gui
 import win32process
 import winerror
 from gspread.utils import rowcol_to_a1
-from PIL import Image
+from PIL import Image, ImageOps
+
+VERSION = "2026-10-23"
 
 KAKAO_MAIN_TITLES = ("카카오톡", "KakaoTalk")
 COL_ROOM, COL_TEXT, COL_IMAGE, COL_STATUS, COL_LAST = "방이름", "문구", "이미지경로", "상태", "마지막발송일시"
@@ -34,9 +38,17 @@ DEFAULT_CONFIG = {
     "spreadsheet_id": "",
     "worksheet": "2번컴터",
     "image_folder": "C:/Users/USER/Desktop/단지마커",
+    "image_folders": ["D:/단지마커", "D:/Desktop/단지마커", "D:/Users/USER/Desktop/단지마커"],
+    "image_max_px": 1280,          # 이미지 가로/세로 최대 크기(px). 큰 사진은 자동으로 줄여서 보냄. 0이면 원본
+    "upload_wait_sec": 4,          # 이미지 보낸 뒤 문구 보내기 전 대기
+    "upload_timeout_sec": 180,     # 업로드가 끝날 때까지 채팅방을 닫지 않고 기다리는 최대 시간
     "delay_between_rooms_min": 4,
     "delay_between_rooms_max": 9,
-    "kakao_wait_sec": 300,
+    "kakao_wait_min": 60,          # 카카오톡 실행/로그인을 기다리는 최대 시간(분)
+    "kakao_path": "",              # 비워두면 C:, D: 기본 설치 위치에서 자동으로 찾음
+    "retry_rounds": 2,             # 실패한 방 재시도 횟수
+    "retry_wait_sec": 120,         # 재시도 전 대기
+    "auto_admin": True,            # 더블클릭 실행 시 관리자 권한으로 자동 재실행
     "test_mode": False,
 }
 
@@ -67,15 +79,47 @@ def setup_logging():
     log.setLevel(logging.INFO)
 
 
+def as_bool(v):
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes", "y", "on", "예")
+    return bool(v)
+
+
+def as_num(v, default):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_config_text(txt):
+    """메모장으로 고치다 생기는 흔한 실수(True 대문자, D:\\단지마커 같은 역슬래시, 마지막 쉼표)는 자동 보정"""
+    try:
+        return json.loads(txt)
+    except json.JSONDecodeError:
+        pass
+    fixed = txt.replace("\u201c", '"').replace("\u201d", '"').replace("\\", "/")
+    fixed = re.sub(r"\bTrue\b", "true", fixed)
+    fixed = re.sub(r"\bFalse\b", "false", fixed)
+    fixed = re.sub(r",\s*([}\]])", r"\1", fixed)
+    try:
+        return json.loads(fixed)
+    except json.JSONDecodeError as e:
+        line = txt.splitlines()[e.lineno - 1].strip() if 0 < e.lineno <= len(txt.splitlines()) else ""
+        raise RuntimeError(f"config.json {e.lineno}번째 줄 형식 오류: {line}  (true/false는 소문자, 따옴표 확인)")
+
+
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
     path = os.path.join(BASE, "config.json")
     if not os.path.exists(path):
         raise RuntimeError("config.json 파일이 exe와 같은 폴더에 없습니다")
     with open(path, encoding="utf-8-sig") as f:
-        cfg.update(json.load(f))
+        cfg.update(parse_config_text(f.read()))
     if not cfg["spreadsheet_id"]:
         raise RuntimeError("config.json 의 spreadsheet_id 가 비어 있습니다")
+    if isinstance(cfg.get("image_folders"), str):
+        cfg["image_folders"] = [cfg["image_folders"]]
     return cfg
 
 
@@ -96,6 +140,10 @@ def open_sheet(cfg):
     if not os.path.exists(key):
         raise RuntimeError("service_account.json 파일이 exe와 같은 폴더에 없습니다")
     gc = gspread.service_account(filename=key)
+    try:
+        gc.set_timeout(60)  # 인터넷이 끊겨도 무한정 멈추지 않게
+    except Exception:
+        pass
     return gc.open_by_key(cfg["spreadsheet_id"]).worksheet(cfg["worksheet"])
 
 
@@ -118,7 +166,7 @@ def load_targets(ws, today):
         room = get(COL_ROOM)
         if not room:
             continue
-        if get(COL_STATUS) == STATUS_DONE and sent_today(get(COL_LAST), today):
+        if get(COL_STATUS).startswith(STATUS_DONE) and sent_today(get(COL_LAST), today):
             continue  # 오늘 이미 보낸 방
         targets.append({"row": r, "room": room, "text": get(COL_TEXT), "image": get(COL_IMAGE)})
     return targets, idx
@@ -235,22 +283,75 @@ def force_foreground(h):
     # 다른 창이 포커스를 쥐고 있어도 앞으로 가져오기 위한 처리
     win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
     win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
-    try:
-        win32gui.SetForegroundWindow(h)
-    except win32gui.error:
-        pass
-    time.sleep(0.5)
-    return win32gui.GetForegroundWindow() == h
-
-
-def wait_for_kakao(timeout):
-    end = time.time() + timeout
-    while time.time() < end:
-        if find_main_window():
+    for _ in range(3):
+        try:
+            win32gui.BringWindowToTop(h)
+            win32gui.SetForegroundWindow(h)
+        except win32gui.error:
+            pass
+        time.sleep(0.5)
+        if win32gui.GetForegroundWindow() == h:
             return True
-        log.info("카카오톡 실행 대기 중...")
-        time.sleep(10)
     return False
+
+
+def find_kakao_exe(cfg):
+    cands = [str(cfg.get("kakao_path") or "").replace("/", "\\")]
+    for drive in ("C:", "D:", "E:"):
+        for sub in ("Program Files (x86)", "Program Files"):
+            cands.append(ntpath.join(drive + "\\", sub, "Kakao", "KakaoTalk", "KakaoTalk.exe"))
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        cands.append(ntpath.join(local, "Kakao", "KakaoTalk", "KakaoTalk.exe"))
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    return ""
+
+
+def launch_kakao(exe):
+    try:
+        subprocess.Popen([exe], cwd=os.path.dirname(exe))
+        return True
+    except Exception as e:
+        log.info(f"  [진단] 카카오톡 실행 실패: {e}")
+        return False
+
+
+def ensure_kakao(cfg):
+    """카톡이 꺼져 있거나 트레이(X로 닫음)에만 있으면 직접 실행해서 메인창을 띄움"""
+    exe = find_kakao_exe(cfg)
+    end = time.time() + as_num(cfg.get("kakao_wait_min"), 60) * 60
+    last_launch = last_log = 0
+    while True:
+        main = find_main_window()
+        if main and win32gui.IsWindowVisible(main) and find_search_edits(main):
+            return True
+        if time.time() >= end:
+            return False
+        now = time.time()
+        if exe and now - last_launch > 180:
+            log.info("카카오톡 메인창이 없어 카카오톡을 실행합니다" if not main else "카카오톡이 트레이에 있어 메인창을 띄웁니다")
+            launch_kakao(exe)
+            last_launch = now
+            time.sleep(8)
+            main = find_main_window()
+            if main and win32gui.IsWindowVisible(main):
+                time.sleep(12)  # 자동 로그인 여유
+                try:
+                    win32gui.ShowWindow(main, win32con.SW_MINIMIZE)
+                except win32gui.error:
+                    pass
+            continue
+        if main and not win32gui.IsWindowVisible(main):
+            try:
+                win32gui.ShowWindow(main, win32con.SW_SHOWMINNOACTIVE)
+            except win32gui.error:
+                pass
+        if now - last_log > 60:
+            log.info("카카오톡 실행/로그인 대기 중..." + ("" if exe else " (카카오톡 설치 위치를 못 찾음 - config의 kakao_path 확인)"))
+            last_log = now
+        time.sleep(10)
 
 
 # ---------------------------------------------------------------- 카카오톡 동작
@@ -291,12 +392,39 @@ def open_room(room):
     raise RuntimeError("채팅방을 찾지 못함(방이름 확인)")
 
 
-def close_room(h):
-    try:
-        win32gui.PostMessage(h, win32con.WM_CLOSE, 0, 0)
-    except win32gui.error:
-        pass
-    time.sleep(0.8)
+def close_room_safely(h, timeout):
+    """업로드가 끝나기 전에 닫으면 '전송 중인 파일' 창이 뜨고 사진이 안 가므로,
+    그런 확인창이 뜨면 취소하고 기다렸다가 다시 닫음. 끝까지 안 되면 방을 열어둠."""
+    pid = window_pid(h)
+    end = time.time() + timeout
+    waited = False
+    while True:
+        if not win32gui.IsWindow(h) or not win32gui.IsWindowVisible(h):
+            return True
+        before = visible_windows_of(pid)
+        try:
+            win32gui.PostMessage(h, win32con.WM_CLOSE, 0, 0)
+        except win32gui.error:
+            return True
+        for _ in range(8):
+            time.sleep(0.25)
+            if not win32gui.IsWindow(h) or not win32gui.IsWindowVisible(h):
+                break
+        new = visible_windows_of(pid) - before - {h}
+        if not win32gui.IsWindow(h) or not win32gui.IsWindowVisible(h):
+            for d in new:
+                log.info(f"  [진단] 채팅방 닫은 뒤 새 창: {describe(d)}")
+            return True
+        # 아직 열려 있음 = '전송 중' 확인창이 떴을 가능성 -> 취소(ESC)하고 업로드 기다림
+        for d in new:
+            if not waited:
+                log.info(f"  [안내] 이미지 업로드 중이라 기다립니다 ({describe(d)})")
+            post_key(d, win32con.VK_ESCAPE)
+        waited = True
+        if time.time() >= end:
+            log.info("  [안내] 업로드가 오래 걸려 채팅방을 열어둡니다(나중에 다시 닫기)")
+            return False
+        time.sleep(5)
 
 
 def find_input(room_hwnd):
@@ -306,17 +434,63 @@ def find_input(room_hwnd):
     raise RuntimeError("채팅 입력창을 찾지 못함")
 
 
+def image_candidates(cfg, value):
+    raw = value.strip().strip('"').strip().replace("/", "\\")
+    drive, rest = ntpath.splitdrive(raw)
+    cands = []
+    if drive:
+        cands.append(raw)
+        for d in ("C:", "D:", "E:"):  # C:에서 D:로 옮겼거나 그 반대인 경우
+            if d.upper() != drive.upper():
+                cands.append(d + rest)
+        name = ntpath.basename(raw)
+    else:
+        name = raw
+    folders = [cfg.get("image_folder")] + list(cfg.get("image_folders") or [])
+    folders += [ntpath.join(os.path.expanduser("~"), "Desktop", "단지마커"), ntpath.join(BASE, "images"), BASE]
+    for f in folders:
+        if f:
+            cands.append(ntpath.join(str(f).replace("/", "\\"), name))
+    seen, out = set(), []
+    for c in cands:
+        if c.lower() not in seen:
+            seen.add(c.lower())
+            out.append(c)
+    return out
+
+
 def resolve_image(cfg, value):
-    path = value.strip().strip('"')
-    if not os.path.isabs(path):
-        path = os.path.join(cfg["image_folder"], path)
-    if not os.path.isfile(path):
-        raise RuntimeError(f"이미지 파일 없음: {path}")
-    return path
+    cands = image_candidates(cfg, value)
+    for i, c in enumerate(cands):
+        if os.path.isfile(c):
+            if i > 0:
+                log.info(f"  [안내] 시트 경로에 이미지가 없어 대신 사용: {c}")
+            return c
+    raise RuntimeError(f"이미지 파일 없음: {cands[0]}")
 
 
-def set_clipboard_image(path):
+def open_clipboard():
+    for _ in range(60):  # 다른 프로그램이 잠깐 쥐고 있어도 최대 15초 기다림
+        try:
+            win32clipboard.OpenClipboard()
+            return
+        except Exception:
+            time.sleep(0.25)
+    raise RuntimeError("클립보드를 사용할 수 없음")
+
+
+_DIB_CACHE = {}
+
+
+def image_to_dib(path, max_px):
+    key = (path, os.path.getmtime(path), max_px)
+    if key in _DIB_CACHE:
+        return _DIB_CACHE[key]
     img = Image.open(path)
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
     if img.mode in ("RGBA", "LA", "P"):
         img = img.convert("RGBA")
         bg = Image.new("RGB", img.size, (255, 255, 255))
@@ -324,17 +498,21 @@ def set_clipboard_image(path):
         img = bg
     else:
         img = img.convert("RGB")
+    if max_px and max(img.size) > max_px:
+        before = img.size
+        img.thumbnail((max_px, max_px), Image.LANCZOS)
+        log.info(f"  [안내] 이미지가 커서 줄여서 보냄: {before[0]}x{before[1]} -> {img.size[0]}x{img.size[1]}")
     buf = io.BytesIO()
     img.save(buf, "BMP")
     dib = buf.getvalue()[14:]  # BMP 파일 헤더 제거
-    for _ in range(10):
-        try:
-            win32clipboard.OpenClipboard()
-            break
-        except Exception:
-            time.sleep(0.3)
-    else:
-        raise RuntimeError("클립보드를 사용할 수 없음")
+    _DIB_CACHE.clear()
+    _DIB_CACHE[key] = dib
+    return dib
+
+
+def set_clipboard_image(path, max_px=1280):
+    dib = image_to_dib(path, int(max_px or 0))
+    open_clipboard()
     try:
         win32clipboard.EmptyClipboard()
         win32clipboard.SetClipboardData(win32clipboard.CF_DIB, dib)
@@ -361,14 +539,31 @@ def click_center(h):
         win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
         time.sleep(0.05)
         win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-        return
-    except Exception:
-        pass
+        return True
+    except Exception as e:
+        log.info(f"  [진단] 커서 이동 실패 -> 메시지 클릭으로 대체 ({e})")
     # 마우스 커서를 못 움직이는 상황(화면 꺼짐 등) -> 창에 직접 클릭 메시지 전송
     lp = win32api.MAKELONG((r - l) // 2, (b - t) // 2)
     win32gui.PostMessage(h, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lp)
     time.sleep(0.05)
     win32gui.PostMessage(h, win32con.WM_LBUTTONUP, 0, lp)
+    return False
+
+
+def focus_input(room_hwnd, edit):
+    """마우스 없이 입력창에 키보드 포커스를 직접 지정"""
+    cur = win32api.GetCurrentThreadId()
+    target = win32process.GetWindowThreadProcessId(room_hwnd)[0]
+    attached = False
+    try:
+        attached = bool(ctypes.windll.user32.AttachThreadInput(cur, target, True))
+        ctypes.windll.user32.SetFocus(edit)
+    except Exception as e:
+        log.info(f"  [진단] 포커스 지정 실패 ({e})")
+    finally:
+        if attached:
+            ctypes.windll.user32.AttachThreadInput(cur, target, False)
+    time.sleep(0.2)
 
 
 ES_CONTINUOUS, ES_SYSTEM_REQUIRED, ES_DISPLAY_REQUIRED = 0x80000000, 0x00000001, 0x00000002
@@ -393,33 +588,44 @@ def describe(h):
         return str(h)
 
 
-def send_image(room_hwnd, path):
-    set_clipboard_image(path)
+def wait_popup(room_hwnd, pid, before, seconds):
+    for _ in range(int(seconds * 4)):
+        time.sleep(0.25)
+        new = visible_windows_of(pid) - before
+        if new:
+            return next(iter(new))
+        fg = win32gui.GetForegroundWindow()
+        if fg and fg != room_hwnd and window_pid(fg) == pid:
+            return fg
+        if not win32gui.IsWindowEnabled(room_hwnd):  # 모달창이 떠서 채팅방이 잠김
+            return -1
+    return 0
+
+
+def send_image(room_hwnd, path, cfg):
+    max_px = int(as_num(cfg.get("image_max_px"), 1280))
+    set_clipboard_image(path, max_px)
     edit = find_input(room_hwnd)
     set_text(edit, "")
     if not force_foreground(room_hwnd):
         raise RuntimeError("채팅방 창을 앞으로 가져오지 못함(화면 잠금 확인)")
-    click_center(edit)  # 입력창에 커서 두기
-    time.sleep(0.4)
+    click_center(edit)
+    focus_input(room_hwnd, edit)
+    time.sleep(0.3)
 
     pid = window_pid(room_hwnd)
     before = visible_windows_of(pid)
-    real_key(ord("V"), ctrl=True)
 
-    popup = 0
-    for _ in range(24):  # 이미지 전송 확인창 대기 (최대 6초)
-        time.sleep(0.25)
-        new = visible_windows_of(pid) - before
-        if new:
-            popup = next(iter(new))
-            break
-        fg = win32gui.GetForegroundWindow()
-        if fg and fg != room_hwnd and window_pid(fg) == pid:
-            popup = fg
-            break
-        if not win32gui.IsWindowEnabled(room_hwnd):  # 모달창이 떠서 채팅방이 잠김
-            popup = -1
-            break
+    # 방법1: Ctrl+V 키 입력
+    real_key(ord("V"), ctrl=True)
+    popup = wait_popup(room_hwnd, pid, before, 3)
+
+    # 방법2: 입력창에 붙여넣기 명령 직접 전송
+    if not popup:
+        log.info("  [진단] Ctrl+V 반응 없음 -> 붙여넣기 명령으로 재시도")
+        set_clipboard_image(path, max_px)
+        win32gui.SendMessage(edit, win32con.WM_PASTE, 0, 0)
+        popup = wait_popup(room_hwnd, pid, before, 3)
 
     if not popup:
         fg = win32gui.GetForegroundWindow()
@@ -437,20 +643,13 @@ def send_image(room_hwnd, path):
         closed = (popup > 0 and (not win32gui.IsWindow(popup) or not win32gui.IsWindowVisible(popup))) or \
                  (popup == -1 and win32gui.IsWindowEnabled(room_hwnd))
         if closed:
-            time.sleep(1.5)  # 업로드 여유
+            time.sleep(as_num(cfg.get("upload_wait_sec"), 4))  # 업로드 여유
             return
     raise RuntimeError("이미지 전송창이 닫히지 않음")
 
 
 def set_clipboard_text(text):
-    for _ in range(10):
-        try:
-            win32clipboard.OpenClipboard()
-            break
-        except Exception:
-            time.sleep(0.3)
-    else:
-        raise RuntimeError("클립보드를 사용할 수 없음")
+    open_clipboard()
     try:
         win32clipboard.EmptyClipboard()
         win32clipboard.SetClipboardData(win32clipboard.CF_UNICODETEXT, text)
@@ -473,6 +672,7 @@ def send_text(room_hwnd, text):
     if force_foreground(room_hwnd):
         # 실제 사람처럼: 입력창 클릭 -> 붙여넣기 -> 엔터
         click_center(edit)
+        focus_input(room_hwnd, edit)
         time.sleep(0.3)
         set_clipboard_text(text)
         real_key(ord("V"), ctrl=True)
@@ -495,57 +695,117 @@ def send_text(room_hwnd, text):
 
 
 # ---------------------------------------------------------------- 메인
+def send_one(cfg, t, leftover):
+    room_hwnd = 0
+    try:
+        if not t["image"] and not t["text"]:
+            raise RuntimeError("문구/이미지가 모두 비어 있음")
+        img_path = resolve_image(cfg, t["image"]) if t["image"] else None
+        room_hwnd = open_room(t["room"])
+        if img_path:
+            send_image(room_hwnd, img_path, cfg)
+        if t["text"]:
+            send_text(room_hwnd, t["text"])
+        status = STATUS_DONE
+        time.sleep(2)
+        if not close_room_safely(room_hwnd, as_num(cfg.get("upload_timeout_sec"), 180)):
+            leftover.append(room_hwnd)
+            status = STATUS_DONE + "(업로드 확인 필요)"
+        room_hwnd = 0
+        return True, status
+    except Exception as e:
+        return False, f"실패: {e}"
+    finally:
+        if room_hwnd:
+            close_room_safely(room_hwnd, 30)
+
+
 def run():
     cfg = load_config()
-    log.info("=== 발송 시작 ===")
+    log.info(f"=== 발송 시작 (버전 {VERSION}, 관리자 권한: {'예' if is_admin() else '아니오'}) ===")
     ws = open_sheet(cfg)
     targets, idx = load_targets(ws, datetime.date.today())
-    if cfg.get("test_mode"):
+    if as_bool(cfg.get("test_mode")):
         targets = targets[:1]
         log.info("[테스트 모드] 첫 번째 방 1개만 발송합니다")
     if not targets:
         log.info("오늘 보낼 대기 항목이 없습니다")
         return
 
-    if not wait_for_kakao(int(cfg["kakao_wait_sec"])):
+    wake_display()
+    if not ensure_kakao(cfg):
         log.info("카카오톡이 실행되어 있지 않아 발송을 중단합니다")
         for t in targets:
             write_result(ws, idx, t["row"], "실패: 카카오톡 미실행")
         return
 
-    wake_display()
-    ok = fail = 0
-    for i, t in enumerate(targets, 1):
-        log.info(f"[{i}/{len(targets)}] {t['room']} 발송 중")
-        room_hwnd = 0
-        try:
-            if not t["image"] and not t["text"]:
-                raise RuntimeError("문구/이미지가 모두 비어 있음")
-            img_path = resolve_image(cfg, t["image"]) if t["image"] else None
-            room_hwnd = open_room(t["room"])
-            if img_path:
-                send_image(room_hwnd, img_path)
-            if t["text"]:
-                send_text(room_hwnd, t["text"])
-            status = STATUS_DONE
-            ok += 1
-            log.info("  -> 발송완료")
-        except Exception as e:
-            status = f"실패: {e}"
-            fail += 1
+    dmin = as_num(cfg.get("delay_between_rooms_min"), 4)
+    dmax = max(dmin, as_num(cfg.get("delay_between_rooms_max"), 9))
+    rounds = 1 + max(0, int(as_num(cfg.get("retry_rounds"), 2)))
+    pending, ok, leftover = targets, 0, []
+    for rnd in range(1, rounds + 1):
+        if rnd > 1:
+            wait = as_num(cfg.get("retry_wait_sec"), 120)
+            log.info(f"--- 실패한 {len(pending)}개 방 재시도 ({rnd - 1}/{rounds - 1}), {int(wait)}초 후 시작 ---")
+            time.sleep(wait)
+            wake_display()
+            if not ensure_kakao(cfg):
+                log.info("카카오톡이 없어 재시도를 중단합니다")
+                break
+        failed = []
+        for i, t in enumerate(pending, 1):
+            log.info(f"[{i}/{len(pending)}] {t['room']} 발송 중")
+            success, status = send_one(cfg, t, leftover)
             log.info(f"  -> {status}")
-        finally:
-            if room_hwnd:
-                close_room(room_hwnd)
-        write_result(ws, idx, t["row"], status)
-        if i < len(targets):
-            time.sleep(random.uniform(float(cfg["delay_between_rooms_min"]), float(cfg["delay_between_rooms_max"])))
+            write_result(ws, idx, t["row"], status)
+            if success:
+                ok += 1
+            else:
+                failed.append(t)
+            if i < len(pending):
+                time.sleep(random.uniform(dmin, dmax))
+        pending = failed
+        if not pending:
+            break
 
-    log.info(f"=== 완료: 성공 {ok} / 실패 {fail} ===")
+    for h in leftover:  # 업로드 때문에 열어둔 방은 마지막에 다시 닫기
+        close_room_safely(h, 60)
+    log.info(f"=== 완료: 성공 {ok} / 실패 {len(pending)} ===")
+
+
+def is_admin():
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def relaunch_as_admin():
+    if getattr(sys, "frozen", False):
+        exe, params = sys.executable, subprocess.list2cmdline(sys.argv[1:])
+    else:
+        exe, params = sys.executable, subprocess.list2cmdline([os.path.abspath(__file__)] + sys.argv[1:])
+    try:
+        return ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, BASE, 1) > 32
+    except Exception:
+        return False
+
+
+def admin_wanted():
+    try:
+        return as_bool(load_config().get("auto_admin", True))
+    except Exception:
+        return True
 
 
 def main():
     setup_logging()
+    auto = "--auto" in sys.argv  # 작업 스케줄러 실행
+    if not is_admin():
+        if not auto and admin_wanted() and relaunch_as_admin():
+            log.info("관리자 권한으로 다시 실행합니다")
+            return
+        log.info("[주의] 관리자 권한이 아닙니다. 카톡이 관리자 권한이면 입력이 막힐 수 있어요")
     mutex = win32event.CreateMutex(None, False, "Local\\KakaoOpenChatSender")  # noqa: F841 중복 실행 방지
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
         log.info("이미 실행 중이라 종료합니다")
