@@ -16,7 +16,7 @@ jobs:
       - name: Install packages
         run: pip install -r requirements.txt pyinstaller
       - name: Build exe
-        run: pyinstaller --onefile --console --name KakaoSender kakao_sender.py
+        run: pyinstaller --onefile --noconsole --name KakaoSender kakao_sender.py
       - name: Collect files
         shell: pwsh
         run: |
