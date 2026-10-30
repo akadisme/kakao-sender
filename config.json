@@ -13,5 +13,6 @@
   "retry_rounds": 2,
   "retry_wait_sec": 120,
   "auto_admin": true,
+  "default_send_time": "11:00",
   "test_mode": false
 }

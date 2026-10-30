@@ -27,11 +27,12 @@ import winerror
 from gspread.utils import rowcol_to_a1
 from PIL import Image, ImageOps
 
-VERSION = "2026-10-23"
+VERSION = "2026-10-30"
 
 KAKAO_MAIN_TITLES = ("카카오톡", "KakaoTalk")
 COL_ROOM, COL_TEXT, COL_IMAGE, COL_STATUS, COL_LAST = "방이름", "문구", "이미지경로", "상태", "마지막발송일시"
 REQUIRED_COLS = (COL_ROOM, COL_TEXT, COL_IMAGE, COL_STATUS, COL_LAST)
+COL_TIME = "발송시간"  # 선택 열: 11:00 / 16:00 / 09:00~12:00(이 시간 안에만) / 비우면 기본시간
 STATUS_DONE = "발송완료"
 
 DEFAULT_CONFIG = {
@@ -49,6 +50,7 @@ DEFAULT_CONFIG = {
     "retry_rounds": 2,             # 실패한 방 재시도 횟수
     "retry_wait_sec": 120,         # 재시도 전 대기
     "auto_admin": True,            # 더블클릭 실행 시 관리자 권한으로 자동 재실행
+    "default_send_time": "11:00",  # 시트 발송시간 칸이 비어 있을 때 쓰는 시간
     "test_mode": False,
 }
 
@@ -134,6 +136,51 @@ def sent_today(value, today):
         return False
 
 
+# ---------------------------------------------------------------- 발송시간
+def parse_clock(text):
+    """'16:00', '16시', '오후 4:00:00', '4:00 PM', '1600' -> 하루 중 분(0~1439). 못 읽으면 None"""
+    t = str(text or "").strip().lower().replace(" ", "")
+    if not t:
+        return None
+    pm = any(k in t for k in ("오후", "pm", "p.m"))
+    am = any(k in t for k in ("오전", "am", "a.m"))
+    nums = re.findall(r"\d+", t)
+    if not nums:
+        return None
+    if len(nums) == 1 and len(nums[0]) in (3, 4) and "시" not in t:  # 1600
+        h, m = int(nums[0][:-2]), int(nums[0][-2:])
+    else:
+        h = int(nums[0])
+        m = int(nums[1]) if len(nums) > 1 else 0
+    if pm and h < 12:
+        h += 12
+    if am and h == 12:
+        h = 0
+    if not (0 <= h <= 24 and 0 <= m < 60):
+        return None
+    return min(h * 60 + m, 24 * 60)
+
+
+def parse_window(text, default):
+    """'16:00' -> (960, None) / '09:00~12:00' -> (540, 720) / 빈칸 -> 기본시간"""
+    raw = str(text or "").strip() or str(default or "11:00")
+    parts = re.split(r"\s*[~〜]\s*|\s+-\s+|(?<=\d)-(?=\s*(?:\d|오|am|pm))", raw, maxsplit=1)
+    start = parse_clock(parts[0])
+    end = parse_clock(parts[1]) if len(parts) > 1 else None
+    if start is None:
+        raise ValueError(f"발송시간을 읽을 수 없음: {raw}")
+    return start, end
+
+
+def fmt_min(m):
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def is_due(window, now_min):
+    start, end = window
+    return now_min >= start and (end is None or now_min < end)
+
+
 # ---------------------------------------------------------------- 구글시트
 def open_sheet(cfg):
     key = os.path.join(BASE, "service_account.json")
@@ -156,6 +203,8 @@ def load_targets(ws, today):
     if missing:
         raise RuntimeError("시트 1행에 열 이름이 없습니다: " + ", ".join(missing))
     idx = {c: header.index(c) + 1 for c in REQUIRED_COLS}  # 1부터 시작
+    if COL_TIME in header:
+        idx[COL_TIME] = header.index(COL_TIME) + 1
 
     targets = []
     for r, row in enumerate(values[1:], start=2):
@@ -168,7 +217,8 @@ def load_targets(ws, today):
             continue
         if get(COL_STATUS).startswith(STATUS_DONE) and sent_today(get(COL_LAST), today):
             continue  # 오늘 이미 보낸 방
-        targets.append({"row": r, "room": room, "text": get(COL_TEXT), "image": get(COL_IMAGE)})
+        targets.append({"row": r, "room": room, "text": get(COL_TEXT), "image": get(COL_IMAGE),
+                        "time": get(COL_TIME) if COL_TIME in idx else ""})
     return targets, idx
 
 
@@ -720,24 +770,53 @@ def send_one(cfg, t, leftover):
             close_room_safely(room_hwnd, 30)
 
 
+def pick_due(cfg, targets, now_min):
+    """지금 보낼 방 / 아직 시간이 안 된 방 / 시간이 지나 오늘은 건너뛰는 방"""
+    due, waiting, missed = [], [], []
+    for t in targets:
+        try:
+            w = parse_window(t["time"], cfg.get("default_send_time"))
+        except ValueError as e:
+            log.info(f"[주의] {t['room']}: {e} -> 기본시간 {cfg.get('default_send_time')} 사용")
+            w = parse_window("", cfg.get("default_send_time"))
+        t["window"] = w
+        if is_due(w, now_min):
+            due.append(t)
+        elif now_min < w[0]:
+            waiting.append(t)
+        else:
+            missed.append(t)
+    return due, waiting, missed
+
+
 def run():
+    """반환값: 사람이 직접 실행했을 때 보여줄 결과 문장"""
     cfg = load_config()
-    log.info(f"=== 발송 시작 (버전 {VERSION}, 관리자 권한: {'예' if is_admin() else '아니오'}) ===")
     ws = open_sheet(cfg)
-    targets, idx = load_targets(ws, datetime.date.today())
+    now = datetime.datetime.now()
+    targets, idx = load_targets(ws, now.date())
+    now_min = now.hour * 60 + now.minute
+    targets, waiting, missed = pick_due(cfg, targets, now_min)
     if as_bool(cfg.get("test_mode")):
         targets = targets[:1]
-        log.info("[테스트 모드] 첫 번째 방 1개만 발송합니다")
     if not targets:
-        log.info("오늘 보낼 대기 항목이 없습니다")
-        return
+        # 30분마다 실행되므로 보낼 게 없을 땐 로그를 남기지 않음
+        nxt = sorted({fmt_min(t["window"][0]) for t in waiting})
+        return "지금 보낼 방이 없어요." + (f"\n오늘 남은 발송시간: {', '.join(nxt)}" if nxt else "")
+
+    log.info(f"=== 발송 시작 (버전 {VERSION}, 관리자 권한: {'예' if is_admin() else '아니오'}) ===")
+    if as_bool(cfg.get("test_mode")):
+        log.info("[테스트 모드] 지금 보낼 방 중 첫 번째 1개만 발송합니다")
+    log.info(f"지금 보낼 방 {len(targets)}개: " + ", ".join(f"{t['room']}({fmt_min(t['window'][0])})" for t in targets))
+    for t in missed:
+        log.info(f"[안내] {t['room']}: 발송 가능 시간({fmt_min(t['window'][0])}~{fmt_min(t['window'][1])})이 지나 오늘은 건너뜀")
 
     wake_display()
     if not ensure_kakao(cfg):
         log.info("카카오톡이 실행되어 있지 않아 발송을 중단합니다")
         for t in targets:
             write_result(ws, idx, t["row"], "실패: 카카오톡 미실행")
-        return
+        return "카카오톡이 실행되어 있지 않아 발송을 못 했어요."
 
     dmin = as_num(cfg.get("delay_between_rooms_min"), 4)
     dmax = max(dmin, as_num(cfg.get("delay_between_rooms_max"), 9))
@@ -771,6 +850,7 @@ def run():
     for h in leftover:  # 업로드 때문에 열어둔 방은 마지막에 다시 닫기
         close_room_safely(h, 60)
     log.info(f"=== 완료: 성공 {ok} / 실패 {len(pending)} ===")
+    return f"발송 완료: 성공 {ok} / 실패 {len(pending)}" + ("\n실패한 방은 시트 상태 칸을 확인하세요." if pending else "")
 
 
 def is_admin():
@@ -803,7 +883,6 @@ def main():
     auto = "--auto" in sys.argv  # 작업 스케줄러 실행
     if not is_admin():
         if not auto and admin_wanted() and relaunch_as_admin():
-            log.info("관리자 권한으로 다시 실행합니다")
             return
         log.info("[주의] 관리자 권한이 아닙니다. 카톡이 관리자 권한이면 입력이 막힐 수 있어요")
     mutex = win32event.CreateMutex(None, False, "Local\\KakaoOpenChatSender")  # noqa: F841 중복 실행 방지
@@ -811,10 +890,15 @@ def main():
         log.info("이미 실행 중이라 종료합니다")
         return
     try:
-        run()
+        msg = run()
     except Exception as e:
         log.exception(f"오류로 중단: {e}")
-    time.sleep(5)
+        msg = f"오류로 중단: {e}\n(logs 폴더의 오늘 날짜 파일 확인)"
+    if not auto and msg:  # 더블클릭으로 실행했을 때만 결과 창 표시
+        try:
+            ctypes.windll.user32.MessageBoxW(0, msg, "카톡 자동발송", 0x40 | 0x40000)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
