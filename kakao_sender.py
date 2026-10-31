@@ -27,7 +27,7 @@ import winerror
 from gspread.utils import rowcol_to_a1
 from PIL import Image, ImageOps
 
-VERSION = "2026-10-30"
+VERSION = "2026-10-31"
 
 KAKAO_MAIN_TITLES = ("카카오톡", "KakaoTalk")
 COL_ROOM, COL_TEXT, COL_IMAGE, COL_STATUS, COL_LAST = "방이름", "문구", "이미지경로", "상태", "마지막발송일시"
@@ -745,6 +745,13 @@ def send_text(room_hwnd, text):
 
 
 # ---------------------------------------------------------------- 메인
+def fill_placeholders(text, now=None):
+    """문구 안의 {날짜} -> 20261031, {오늘} -> 2026-10-31 (보내는 순간의 날짜로 바꿈)"""
+    now = now or datetime.datetime.now()
+    return (text.replace("{날짜}", now.strftime("%Y%m%d"))
+                .replace("{오늘}", now.strftime("%Y-%m-%d")))
+
+
 def send_one(cfg, t, leftover):
     room_hwnd = 0
     try:
@@ -755,7 +762,7 @@ def send_one(cfg, t, leftover):
         if img_path:
             send_image(room_hwnd, img_path, cfg)
         if t["text"]:
-            send_text(room_hwnd, t["text"])
+            send_text(room_hwnd, fill_placeholders(t["text"]))
         status = STATUS_DONE
         time.sleep(2)
         if not close_room_safely(room_hwnd, as_num(cfg.get("upload_timeout_sec"), 180)):
